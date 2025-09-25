@@ -1,69 +1,136 @@
 import { ClientSecretCredential, ManagedIdentityCredential } from "@azure/identity";
 
-/**
- * Helper: token do Graph
- */
-async function getGraphToken() {
-  const scope = "https://graph.microsoft.com/.default";
-  const useMI = process.env.USE_MANAGED_IDENTITY === "true";
-
-  if (useMI) {
-    const cred = new ManagedIdentityCredential();
-    const token = await cred.getToken(scope);
-    return token.token;
-  } else {
-    const tenantId = process.env.TENANT_ID;
-    const clientId = process.env.CLIENT_ID;
-    const clientSecret = process.env.CLIENT_SECRET;
-    const cred = new ClientSecretCredential(tenantId, clientId, clientSecret);
-    const token = await cred.getToken(scope);
-    return token.token;
-  }
+function getCredential() {
+  return process.env.USE_MANAGED_IDENTITY === "true"
+    ? new ManagedIdentityCredential()
+    : new ClientSecretCredential(process.env.TENANT_ID, process.env.CLIENT_ID, process.env.CLIENT_SECRET);
 }
-
-/**
- * Helper: GET JSON do Graph
- */
-async function graphGetJson(url, token) {
+async function getToken(cred, scope) {
+  const t = await cred.getToken(scope);
+  return t.token;
+}
+async function httpJson(url, token) {
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) return null;
-  return await r.json();
+  if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status, url });
+  return r.json();
+}
+async function httpRaw(url, token) {
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status, url });
+  return r;
 }
 
 export default async function (context, req) {
   try {
-    const { driveId, itemId } = req.query || {};
+    const q = req.query || {};
+    const cred = getCredential();
+    const graphToken = await getToken(cred, "https://graph.microsoft.com/.default");
 
-    if (!driveId || !itemId) {
-      context.res = { status: 400, body: "Parâmetros obrigatórios: driveId, itemId." };
-      return;
+    let driveId, driveItemId, fileName = "file", contentType = "application/octet-stream";
+    let crmExpenseId = null; // para futura validação
+
+    // ==============================
+    // A) Receber por ItemId (SharePoint)
+    // ==============================
+    if (q.mode === "spitem") {
+      const siteHost = q.siteHost || process.env.SP_SITE_HOST;
+      const sitePath = q.sitePath || process.env.SP_SITE_PATH;
+      const spItemId = q.spItemId;
+      if (!siteHost || !sitePath || !spItemId) {
+        context.res = { status: 400, body: "Faltam parâmetros: siteHost/sitePath (ou definir em app settings) e spItemId." };
+        return;
+      }
+
+      // 1) siteId
+      const site = await httpJson(
+        `https://graph.microsoft.com/v1.0/sites/${encodeURIComponent(siteHost)}:/${encodeURIComponent(sitePath)}?select=id`,
+        graphToken
+      );
+      const siteId = site.id;
+
+      // 2) listId
+      let listId = q.listId || process.env.SP_LIST_ID;
+      if (!listId) {
+        if (!q.listTitle) {
+          context.res = { status: 400, body: "Falta listId (ou SP_LIST_ID) ou listTitle." };
+          return;
+        }
+        const lists = await httpJson(
+          `https://graph.microsoft.com/v1.0/sites/${siteId}/lists?$select=id,displayName&$filter=displayName eq '${encodeURIComponent(q.listTitle)}'`,
+          graphToken
+        );
+        if (!lists.value?.length) { context.res = { status: 404, body: "Lista não encontrada." }; return; }
+        listId = lists.value[0].id;
+      }
+
+      // 3) obter driveItem + fields a partir do ItemId
+      const li = await httpJson(
+        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items/${encodeURIComponent(spItemId)}?$expand=driveItem`,
+        graphToken
+      );
+      // (se precisares de metadados/CrmExpenseId:)
+      const fields = await httpJson(
+        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items/${encodeURIComponent(spItemId)}/fields`,
+        graphToken
+      );
+      crmExpenseId = fields?.CrmExpenseId || null;
+
+      driveItemId = li?.driveItem?.id;
+      driveId = li?.driveItem?.parentReference?.driveId;
+      fileName = li?.driveItem?.name || fileName;
+      contentType = li?.driveItem?.file?.mimeType || contentType;
+
+      if (!driveItemId || !driveId) {
+        context.res = { status: 404, body: "driveItem não encontrado para esse ItemId." };
+        return;
+      }
+    }
+    // ==============================
+    // B) Receber por driveId + itemId (Graph)
+    // ==============================
+    else {
+      driveId = q.driveId;
+      driveItemId = q.itemId;
+      if (!driveId || !driveItemId) {
+        context.res = { status: 400, body: "Parâmetros obrigatórios: mode=spitem&spItemId=... (com site/list) OU driveId & itemId." };
+        return;
+      }
+      // Metadados mínimos (nome/mime)
+      const meta = await httpJson(
+        `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}?select=name,file`,
+        graphToken
+      );
+      fileName = meta?.name || fileName;
+      contentType = meta?.file?.mimeType || contentType;
+      // (se fores usar validação por CrmExpenseId quando vier por Graph IDs:)
+      // const fields = await httpJson(
+      //   `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}/listItem/fields`,
+      //   graphToken
+      // );
+      // crmExpenseId = fields?.CrmExpenseId || null;
     }
 
-    const token = await getGraphToken();
+    // ==============================
+    // (Opcional) Validação CRM — ativa depois
+    // ==============================
+    // if (!crmExpenseId) return context.res = { status: 403, body: "Ficheiro sem CrmExpenseId associado." };
+    // const user = getUserFromEasyAuth(req); // ler OID/UPN do cabeçalho X-MS-CLIENT-PRINCIPAL (EasyAuth)
+    // const dvToken = await getToken(cred, `${process.env.DATAVERSE_ORG_URL}/.default`);
+    // const dvRes = await fetch(`${process.env.DATAVERSE_ORG_URL}/api/data/v9.2/new_expenses(${crmExpenseId})`, {
+    //   headers: { Authorization: `Bearer ${dvToken}`, "OData-Version": "4.0", Accept: "application/json", CallerObjectId: user.oid }
+    // });
+    // if (dvRes.status !== 200) return context.res = { status: 403, body: "Não tens acesso a esta despesa no CRM." };
 
-    // 1) Metadados (nome, mime type)
-    const metaUrl = `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(itemId)}`;
-    const meta = await graphGetJson(metaUrl, token);
-    if (!meta) {
-      context.res = { status: 404, body: "Ficheiro não encontrado." };
-      return;
-    }
-
-    const fileName = meta?.name || "file";
-    const contentType = meta?.file?.mimeType || "application/octet-stream";
+    // ==============================
+    // Download do conteúdo e resposta
+    // ==============================
+    const content = await httpRaw(
+      `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}/content`,
+      graphToken
+    );
+    const buffer = Buffer.from(await content.arrayBuffer());
     const disposition = (process.env.DEFAULT_DISPOSITION || "inline") + `; filename="${fileName}"`;
 
-    // 2) Conteúdo
-    const contentUrl = `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(itemId)}/content`;
-    const fileRes = await fetch(contentUrl, { headers: { Authorization: `Bearer ${token}` } });
-
-    if (!fileRes.ok) {
-      context.res = { status: fileRes.status, body: "Conteúdo não disponível." };
-      return;
-    }
-
-    // SIMPLES: buffer em memória (ok para PDFs/imagens típicas)
-    const buffer = Buffer.from(await fileRes.arrayBuffer());
     context.res = {
       status: 200,
       headers: {
@@ -73,11 +140,8 @@ export default async function (context, req) {
       },
       body: buffer
     };
-
-    // Se quiseres evitar buffer em memória (ficheiros muito grandes):
-    // Usa body como stream e isRaw: true (depende do host). Mantive simples aqui.
   } catch (err) {
     context.log.error(err);
-    context.res = { status: 500, body: "Erro interno ao processar o ficheiro." };
+    context.res = { status: err.status || 500, body: err.status ? `Erro ${err.status}` : "Erro interno" };
   }
 }
