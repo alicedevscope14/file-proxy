@@ -12,24 +12,43 @@ async function getToken(cred, scope) {
 }
 function getUserFromEasyAuth(req) {
   const b64 = req.headers["x-ms-client-principal"];
-  if (!b64) throw Object.assign(new Error("Não autenticado"), { status: 401 });
+  if (!b64) {
+    const err = new Error("EasyAuth: pedido sem identidade (verifica Require authentication = On).");
+    err.status = 401;
+    throw err;
+  }
   const principal = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
   const claims = Object.fromEntries(principal.claims.map(c => [c.typ, c.val]));
   const oid = claims["http://schemas.microsoft.com/identity/claims/objectidentifier"];
   const upn = claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"];
-  if (!oid) throw Object.assign(new Error("Sem OID do utilizador"), { status: 401 });
+  if (!oid) {
+    const err = new Error("EasyAuth: sem OID do utilizador nas claims.");
+    err.status = 401;
+    throw err;
+  }
   return { oid, upn };
 }
 
 // ===== HTTP helpers =====
 async function httpJson(url, token) {
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status, url });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    const err = new Error(`HTTP ${r.status} at ${url}: ${txt}`);
+    err.status = r.status;
+    throw err;
+  }
   return r.json();
 }
+
 async function httpRaw(url, token) {
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status, url });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    const err = new Error(`HTTP ${r.status} at ${url}: ${txt}`);
+    err.status = r.status;
+    throw err;
+  }
   return r;
 }
 
@@ -54,12 +73,14 @@ export default async function (context, req) {
         return;
       }
 
+      // 1) siteId
       const site = await httpJson(
         `https://graph.microsoft.com/v1.0/sites/${encodeURIComponent(siteHost)}:/${encodeURIComponent(sitePath)}?select=id`,
         graphToken
       );
       const siteId = site.id;
 
+      // 2) listId
       let effListId = listId;
       if (!effListId) {
         if (!q.listTitle) {
@@ -74,12 +95,12 @@ export default async function (context, req) {
         effListId = lists.value[0].id;
       }
 
-      // driveItem (para id/driveId/mime)…
+      // 3) driveItem (para id/driveId/mime)
       const li = await httpJson(
         `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${effListId}/items/${encodeURIComponent(spItemId)}?$expand=driveItem`,
         graphToken
       );
-      // fields (para CrmExpenseId)…
+      // 4) fields (para CrmExpenseId)
       const fields = await httpJson(
         `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${effListId}/items/${encodeURIComponent(spItemId)}/fields`,
         graphToken
@@ -111,7 +132,7 @@ export default async function (context, req) {
       fileName    = meta?.name || fileName;
       contentType = meta?.file?.mimeType || contentType;
 
-      // ler fields → CrmExpenseId
+      // fields → CrmExpenseId
       const fields = await httpJson(
         `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}/listItem/fields`,
         graphToken
@@ -125,29 +146,51 @@ export default async function (context, req) {
       return;
     }
 
-    // 1) quem é o utilizador autenticado (EasyAuth TEM de estar ativo na Function App)
+    // 1) Utilizador autenticado (EasyAuth)
     const user = getUserFromEasyAuth(req);
 
-    // 2) token app-only para o Dataverse
+    // 2) Token app-only para o Dataverse
     const dvOrg = process.env.DATAVERSE_ORG_URL; // ex: https://org.crm4.dynamics.com
     const dvToken = await getToken(cred, `${dvOrg}/.default`);
 
-    // 3) tentar LER o registo como esse utilizador (impersonation)
-    const entityLogicalName = process.env.CRM_ENTITY_LOGICAL_NAME || "dev_expenses"; // <— ALINHAR aqui
+    // 3) Mapeia OID -> systemuserid
+    //    (precisa que o utilizador exista e esteja Enabled no Dataverse)
+    const usersUrl = `${dvOrg}/api/data/v9.2/systemusers`
+      + `?$select=systemuserid,azureactivedirectoryobjectid,domainname,isdisabled`
+      + `&$filter=azureactivedirectoryobjectid eq ${user.oid}`;
+    const usersRes = await fetch(usersUrl, {
+      headers: { Authorization: `Bearer ${dvToken}`, Accept: "application/json", "OData-Version": "4.0" }
+    });
+    if (usersRes.status !== 200) {
+      context.log.warn(`Dataverse systemusers lookup falhou status=${usersRes.status}`);
+      context.res = { status: 403, body: "Não tens acesso (utilizador não mapeado no CRM)." };
+      return;
+    }
+    const users = await usersRes.json();
+    const systemUserId = users?.value?.[0]?.systemuserid;
+    const isDisabled = users?.value?.[0]?.isdisabled;
+    if (!systemUserId || isDisabled) {
+      context.log.warn(`Sem systemuser válido para OID=${user.oid} (disabled=${isDisabled})`);
+      context.res = { status: 403, body: "Não tens acesso (utilizador não existe/está desativado no CRM)." };
+      return;
+    }
+
+    // 4) Ler o registo como esse utilizador (impersonação estável com MSCRMCallerID)
+    const entityLogicalName = process.env.CRM_ENTITY_LOGICAL_NAME || "dev_expenses"; // <- ajusta
     const dvUrl = `${dvOrg}/api/data/v9.2/${entityLogicalName}(${crmExpenseId})`;
     const dvRes = await fetch(dvUrl, {
       headers: {
         Authorization: `Bearer ${dvToken}`,
         Accept: "application/json",
         "OData-Version": "4.0",
-        // Impersonação preferida: Azure AD Object Id do utilizador
-        CallerObjectId: user.oid
+        // Impersonação por Dataverse UserId
+        MSCRMCallerID: systemUserId
       }
     });
 
-    // 200 => OK; 403/404 => sem acesso (ou não existe)
     if (dvRes.status !== 200) {
-      context.log.warn(`DENY crmExpenseId=${crmExpenseId} userOid=${user.oid} status=${dvRes.status}`);
+      const body = await dvRes.text().catch(() => "");
+      context.log.warn(`DENY crmExpenseId=${crmExpenseId} sysUser=${systemUserId} status=${dvRes.status} body=${body}`);
       context.res = { status: 403, body: "Não tens acesso a esta despesa no CRM." };
       return;
     }
@@ -172,6 +215,9 @@ export default async function (context, req) {
   } catch (err) {
     context.log.error(err);
     const status = err.status || 500;
-    context.res = { status, body: status === 401 ? "Não autenticado" : status === 403 ? "Sem autorização" : "Erro interno" };
+    const msg = status === 401 ? "Não autenticado"
+              : status === 403 ? "Sem autorização"
+              : "Erro interno";
+    context.res = { status, body: msg };
   }
 }
