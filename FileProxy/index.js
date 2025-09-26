@@ -1,5 +1,6 @@
 import { ClientSecretCredential, ManagedIdentityCredential } from "@azure/identity";
 
+// ===== Auth helpers =====
 function getCredential() {
   return process.env.USE_MANAGED_IDENTITY === "true"
     ? new ManagedIdentityCredential()
@@ -9,6 +10,18 @@ async function getToken(cred, scope) {
   const t = await cred.getToken(scope);
   return t.token;
 }
+function getUserFromEasyAuth(req) {
+  const b64 = req.headers["x-ms-client-principal"];
+  if (!b64) throw Object.assign(new Error("Não autenticado"), { status: 401 });
+  const principal = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+  const claims = Object.fromEntries(principal.claims.map(c => [c.typ, c.val]));
+  const oid = claims["http://schemas.microsoft.com/identity/claims/objectidentifier"];
+  const upn = claims["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"];
+  if (!oid) throw Object.assign(new Error("Sem OID do utilizador"), { status: 401 });
+  return { oid, upn };
+}
+
+// ===== HTTP helpers =====
 async function httpJson(url, token) {
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!r.ok) throw Object.assign(new Error(await r.text()), { status: r.status, url });
@@ -27,30 +40,28 @@ export default async function (context, req) {
     const graphToken = await getToken(cred, "https://graph.microsoft.com/.default");
 
     let driveId, driveItemId, fileName = "file", contentType = "application/octet-stream";
-    let crmExpenseId = null; // para futura validação
+    let crmExpenseId = null;
 
-    // ==============================
-    // A) Receber por ItemId (SharePoint)
-    // ==============================
+    // ===== A) Receber por ItemId (SharePoint) =====
     if (q.mode === "spitem") {
       const siteHost = q.siteHost || process.env.SP_SITE_HOST;
       const sitePath = q.sitePath || process.env.SP_SITE_PATH;
       const spItemId = q.spItemId;
+      const listId   = q.listId || process.env.SP_LIST_ID;
+
       if (!siteHost || !sitePath || !spItemId) {
-        context.res = { status: 400, body: "Faltam parâmetros: siteHost/sitePath (ou definir em app settings) e spItemId." };
+        context.res = { status: 400, body: "Faltam parâmetros: siteHost/sitePath (ou app settings) e spItemId." };
         return;
       }
 
-      // 1) siteId
       const site = await httpJson(
         `https://graph.microsoft.com/v1.0/sites/${encodeURIComponent(siteHost)}:/${encodeURIComponent(sitePath)}?select=id`,
         graphToken
       );
       const siteId = site.id;
 
-      // 2) listId
-      let listId = q.listId || process.env.SP_LIST_ID;
-      if (!listId) {
+      let effListId = listId;
+      if (!effListId) {
         if (!q.listTitle) {
           context.res = { status: 400, body: "Falta listId (ou SP_LIST_ID) ou listTitle." };
           return;
@@ -60,70 +71,88 @@ export default async function (context, req) {
           graphToken
         );
         if (!lists.value?.length) { context.res = { status: 404, body: "Lista não encontrada." }; return; }
-        listId = lists.value[0].id;
+        effListId = lists.value[0].id;
       }
 
-      // 3) obter driveItem + fields a partir do ItemId
+      // driveItem (para id/driveId/mime)…
       const li = await httpJson(
-        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items/${encodeURIComponent(spItemId)}?$expand=driveItem`,
+        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${effListId}/items/${encodeURIComponent(spItemId)}?$expand=driveItem`,
         graphToken
       );
-      // (se precisares de metadados/CrmExpenseId:)
+      // fields (para CrmExpenseId)…
       const fields = await httpJson(
-        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items/${encodeURIComponent(spItemId)}/fields`,
+        `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${effListId}/items/${encodeURIComponent(spItemId)}/fields`,
         graphToken
       );
-      crmExpenseId = fields?.CrmExpenseId || null;
 
-      driveItemId = li?.driveItem?.id;
-      driveId = li?.driveItem?.parentReference?.driveId;
-      fileName = li?.driveItem?.name || fileName;
-      contentType = li?.driveItem?.file?.mimeType || contentType;
+      crmExpenseId = fields?.CrmExpenseId || null;
+      driveItemId  = li?.driveItem?.id;
+      driveId      = li?.driveItem?.parentReference?.driveId;
+      fileName     = li?.driveItem?.name || fileName;
+      contentType  = li?.driveItem?.file?.mimeType || contentType;
 
       if (!driveItemId || !driveId) {
         context.res = { status: 404, body: "driveItem não encontrado para esse ItemId." };
         return;
       }
     }
-    // ==============================
-    // B) Receber por driveId + itemId (Graph)
-    // ==============================
+    // ===== B) Receber por driveId + itemId (Graph) =====
     else {
       driveId = q.driveId;
       driveItemId = q.itemId;
       if (!driveId || !driveItemId) {
-        context.res = { status: 400, body: "Parâmetros obrigatórios: mode=spitem&spItemId=... (com site/list) OU driveId & itemId." };
+        context.res = { status: 400, body: "Parâmetros obrigatórios: mode=spitem&spItemId=... OU driveId & itemId." };
         return;
       }
-      // Metadados mínimos (nome/mime)
       const meta = await httpJson(
         `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}?select=name,file`,
         graphToken
       );
-      fileName = meta?.name || fileName;
+      fileName    = meta?.name || fileName;
       contentType = meta?.file?.mimeType || contentType;
-      // (se fores usar validação por CrmExpenseId quando vier por Graph IDs:)
-      // const fields = await httpJson(
-      //   `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}/listItem/fields`,
-      //   graphToken
-      // );
-      // crmExpenseId = fields?.CrmExpenseId || null;
+
+      // ler fields → CrmExpenseId
+      const fields = await httpJson(
+        `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}/listItem/fields`,
+        graphToken
+      );
+      crmExpenseId = fields?.CrmExpenseId || null;
     }
 
-    // ==============================
-    // (Opcional) Validação CRM — ativa depois
-    // ==============================
-    // if (!crmExpenseId) return context.res = { status: 403, body: "Ficheiro sem CrmExpenseId associado." };
-    // const user = getUserFromEasyAuth(req); // ler OID/UPN do cabeçalho X-MS-CLIENT-PRINCIPAL (EasyAuth)
-    // const dvToken = await getToken(cred, `${process.env.DATAVERSE_ORG_URL}/.default`);
-    // const dvRes = await fetch(`${process.env.DATAVERSE_ORG_URL}/api/data/v9.2/new_expenses(${crmExpenseId})`, {
-    //   headers: { Authorization: `Bearer ${dvToken}`, "OData-Version": "4.0", Accept: "application/json", CallerObjectId: user.oid }
-    // });
-    // if (dvRes.status !== 200) return context.res = { status: 403, body: "Não tens acesso a esta despesa no CRM." };
+    // ===== Validação com CRM (Dataverse) =====
+    if (!crmExpenseId) {
+      context.res = { status: 403, body: "Ficheiro sem CrmExpenseId associado." };
+      return;
+    }
 
-    // ==============================
-    // Download do conteúdo e resposta
-    // ==============================
+    // 1) quem é o utilizador autenticado (EasyAuth TEM de estar ativo na Function App)
+    const user = getUserFromEasyAuth(req);
+
+    // 2) token app-only para o Dataverse
+    const dvOrg = process.env.DATAVERSE_ORG_URL; // ex: https://org.crm4.dynamics.com
+    const dvToken = await getToken(cred, `${dvOrg}/.default`);
+
+    // 3) tentar LER o registo como esse utilizador (impersonation)
+    const entityLogicalName = process.env.CRM_ENTITY_LOGICAL_NAME || "dev_expenses"; // <— ALINHAR aqui
+    const dvUrl = `${dvOrg}/api/data/v9.2/${entityLogicalName}(${crmExpenseId})`;
+    const dvRes = await fetch(dvUrl, {
+      headers: {
+        Authorization: `Bearer ${dvToken}`,
+        Accept: "application/json",
+        "OData-Version": "4.0",
+        // Impersonação preferida: Azure AD Object Id do utilizador
+        CallerObjectId: user.oid
+      }
+    });
+
+    // 200 => OK; 403/404 => sem acesso (ou não existe)
+    if (dvRes.status !== 200) {
+      context.log.warn(`DENY crmExpenseId=${crmExpenseId} userOid=${user.oid} status=${dvRes.status}`);
+      context.res = { status: 403, body: "Não tens acesso a esta despesa no CRM." };
+      return;
+    }
+
+    // ===== Conteúdo do ficheiro =====
     const content = await httpRaw(
       `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(driveItemId)}/content`,
       graphToken
@@ -142,6 +171,7 @@ export default async function (context, req) {
     };
   } catch (err) {
     context.log.error(err);
-    context.res = { status: err.status || 500, body: err.status ? `Erro ${err.status}` : "Erro interno" };
+    const status = err.status || 500;
+    context.res = { status, body: status === 401 ? "Não autenticado" : status === 403 ? "Sem autorização" : "Erro interno" };
   }
 }
