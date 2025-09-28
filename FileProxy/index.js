@@ -62,7 +62,7 @@ export default async function (context, req) {
   try {
     const q = req.query || {};
     
-    // === ROTA DE DIAGNOSTICO ===
+    // === ROTA DE DIAGNÓSTICO ===
     if (q.mode === "debug") {
       const cred = getCredential();
       const dvOrg = process.env.DATAVERSE_ORG_URL;
@@ -77,7 +77,7 @@ export default async function (context, req) {
       }
       
       try {
-        // Obtem info do utilizador
+        // Obtém info do utilizador
         const user = getUserFromEasyAuth(req);
         
         // Token para Dataverse
@@ -125,13 +125,42 @@ export default async function (context, req) {
             "OData-Version": "4.0"
           }
         });
+        
+        let allUsersData = null;
+        let errorDetails = null;
+        
+        if (allRes.status !== 200) {
+          errorDetails = await allRes.text().catch(() => "Unable to read error");
+        } else {
+          allUsersData = await allRes.json();
+        }
+        
         results.sampleUsers = {
           status: allRes.status,
-          users: allRes.status === 200 ? (await allRes.json()).value.map(u => ({
+          errorDetails: errorDetails,
+          users: allUsersData ? allUsersData.value.map(u => ({
             name: u.fullname,
             email: u.domainname,
-            hasOid: !!u.azureactivedirectoryobjectid
+            hasOid: !!u.azureactivedirectoryobjectid,
+            oid: u.azureactivedirectoryobjectid
           })) : []
+        };
+        
+        // 4. Testa acesso à entidade de despesas
+        const testExpenseUrl = `${dvOrg}/api/data/v9.2/${process.env.CRM_ENTITY_LOGICAL_NAME || "dev_expense"}?$top=1`;
+        const expenseRes = await fetch(testExpenseUrl, {
+          headers: { 
+            Authorization: `Bearer ${dvToken}`, 
+            Accept: "application/json", 
+            "OData-Version": "4.0"
+          }
+        });
+        
+        results.expenseEntityAccess = {
+          status: expenseRes.status,
+          entityName: process.env.CRM_ENTITY_LOGICAL_NAME || "dev_expense",
+          hasAccess: expenseRes.status === 200,
+          error: expenseRes.status !== 200 ? await expenseRes.text().catch(() => "") : null
         };
         
         context.res = {
