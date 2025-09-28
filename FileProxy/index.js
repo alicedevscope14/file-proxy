@@ -61,6 +61,112 @@ async function httpRaw(url, token) {
 export default async function (context, req) {
   try {
     const q = req.query || {};
+    
+    // === ROTA DE DIAGNOSTICO ===
+    if (q.mode === "debug") {
+      const cred = getCredential();
+      const dvOrg = process.env.DATAVERSE_ORG_URL;
+      
+      if (!dvOrg) {
+        context.res = { 
+          status: 200, 
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ error: "DATAVERSE_ORG_URL não configurado" }, null, 2)
+        };
+        return;
+      }
+      
+      try {
+        // Obtem info do utilizador
+        const user = getUserFromEasyAuth(req);
+        
+        // Token para Dataverse
+        const dvToken = await getToken(cred, `${dvOrg}/.default`);
+        
+        // Procura o utilizador de várias formas
+        const results = {};
+        
+        // 1. Por OID
+        const oidUrl = `${dvOrg}/api/data/v9.2/systemusers?$select=systemuserid,fullname,domainname,azureactivedirectoryobjectid&$filter=azureactivedirectoryobjectid eq '${user.oid}'`;
+        const oidRes = await fetch(oidUrl, {
+          headers: { 
+            Authorization: `Bearer ${dvToken}`, 
+            Accept: "application/json", 
+            "OData-Version": "4.0"
+          }
+        });
+        results.byOid = {
+          status: oidRes.status,
+          found: oidRes.status === 200 ? (await oidRes.json()).value : []
+        };
+        
+        // 2. Por UPN/domainname
+        if (user.upn) {
+          const upnUrl = `${dvOrg}/api/data/v9.2/systemusers?$select=systemuserid,fullname,domainname,azureactivedirectoryobjectid&$filter=domainname eq '${user.upn}'`;
+          const upnRes = await fetch(upnUrl, {
+            headers: { 
+              Authorization: `Bearer ${dvToken}`, 
+              Accept: "application/json", 
+              "OData-Version": "4.0"
+            }
+          });
+          results.byUpn = {
+            status: upnRes.status,
+            found: upnRes.status === 200 ? (await upnRes.json()).value : []
+          };
+        }
+        
+        // 3. Lista todos os utilizadores ativos (limitado a 10)
+        const allUrl = `${dvOrg}/api/data/v9.2/systemusers?$select=systemuserid,fullname,domainname,azureactivedirectoryobjectid,isdisabled&$filter=isdisabled eq false&$top=10`;
+        const allRes = await fetch(allUrl, {
+          headers: { 
+            Authorization: `Bearer ${dvToken}`, 
+            Accept: "application/json", 
+            "OData-Version": "4.0"
+          }
+        });
+        results.sampleUsers = {
+          status: allRes.status,
+          users: allRes.status === 200 ? (await allRes.json()).value.map(u => ({
+            name: u.fullname,
+            email: u.domainname,
+            hasOid: !!u.azureactivedirectoryobjectid
+          })) : []
+        };
+        
+        context.res = {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            debug: true,
+            currentUser: {
+              oid: user.oid,
+              upn: user.upn
+            },
+            searchResults: results,
+            environment: {
+              dataverseUrl: dvOrg,
+              entityName: process.env.CRM_ENTITY_LOGICAL_NAME || "dev_expenses"
+            }
+          }, null, 2)
+        };
+        return;
+        
+      } catch (err) {
+        context.res = {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            debug: true,
+            error: err.message,
+            stack: err.stack
+          }, null, 2)
+        };
+        return;
+      }
+    }
+    // === FIM DA ROTA DE DIAGNÓSTICO ===
+    
     const cred = getCredential();
     const graphToken = await getToken(cred, "https://graph.microsoft.com/.default");
 
@@ -186,14 +292,15 @@ export default async function (context, req) {
     
     const dvToken = await getToken(cred, `${dvOrg}/.default`);
 
-    // 3) Mapeia OID -> systemuserid (CORREÇÃO: aspas no GUID)
-    const usersUrl = `${dvOrg}/api/data/v9.2/systemusers`
-      + `?$select=systemuserid,azureactivedirectoryobjectid,domainname,fullname,isdisabled`
-      + `&$filter=azureactivedirectoryobjectid eq '${user.oid}'`; // CORREÇÃO: aspas adicionadas
+    // 3) Mapeia OID -> systemuserid 
+    // NOTA: Tenta primeiro por OID, depois por UPN se falhar
+    let usersUrl = `${dvOrg}/api/data/v9.2/systemusers`
+      + `?$select=systemuserid,azureactivedirectoryobjectid,domainname,fullname,internalemailaddress,isdisabled`
+      + `&$filter=azureactivedirectoryobjectid eq '${user.oid}'`;
     
-    context.log(`Procurando utilizador no Dataverse: ${usersUrl}`);
+    context.log(`Procurando utilizador no Dataverse por OID: ${user.oid}`);
     
-    const usersRes = await fetch(usersUrl, {
+    let usersRes = await fetch(usersUrl, {
       headers: { 
         Authorization: `Bearer ${dvToken}`, 
         Accept: "application/json", 
@@ -202,12 +309,39 @@ export default async function (context, req) {
       }
     });
     
+    // Se não encontrou por OID, tenta por UPN
+    if (usersRes.status !== 200 || (await usersRes.clone().json()).value?.length === 0) {
+      if (user.upn) {
+        context.log(`Não encontrado por OID, tentando por UPN: ${user.upn}`);
+        
+        // Tenta por domainname (UPN)
+        usersUrl = `${dvOrg}/api/data/v9.2/systemusers`
+          + `?$select=systemuserid,azureactivedirectoryobjectid,domainname,fullname,internalemailaddress,isdisabled`
+          + `&$filter=domainname eq '${user.upn}' or internalemailaddress eq '${user.upn}'`;
+        
+        usersRes = await fetch(usersUrl, {
+          headers: { 
+            Authorization: `Bearer ${dvToken}`, 
+            Accept: "application/json", 
+            "OData-Version": "4.0",
+            "Prefer": "odata.include-annotations=*"
+          }
+        });
+      }
+    }
+    
     if (usersRes.status !== 200) {
       const errorText = await usersRes.text().catch(() => "");
       context.log.error(`Dataverse systemusers lookup falhou status=${usersRes.status}, erro: ${errorText}`);
+      
+      // Log adicional para debug
+      context.log.error(`Debug - OID tentado: ${user.oid}`);
+      context.log.error(`Debug - UPN tentado: ${user.upn}`);
+      context.log.error(`Debug - URL completa: ${usersUrl}`);
+      
       context.res = { 
         status: 403, 
-        body: `Não tens acesso (utilizador não mapeado no CRM). Status: ${usersRes.status}` 
+        body: `Não tens acesso (utilizador não mapeado no CRM). Status: ${usersRes.status}. OID: ${user.oid?.substring(0,8)}...` 
       };
       return;
     }
@@ -216,7 +350,12 @@ export default async function (context, req) {
     context.log(`Utilizadores encontrados: ${users?.value?.length || 0}`);
     
     if (users?.value?.length > 0) {
-      context.log(`Utilizador CRM: ${users.value[0].fullname}, SystemUserId: ${users.value[0].systemuserid}`);
+      const user = users.value[0];
+      context.log(`Utilizador CRM encontrado:`);
+      context.log(`  - Nome: ${user.fullname}`);
+      context.log(`  - SystemUserId: ${user.systemuserid}`);
+      context.log(`  - Email/Domain: ${user.domainname || user.internalemailaddress}`);
+      context.log(`  - Azure OID no CRM: ${user.azureactivedirectoryobjectid || 'NÃO PREENCHIDO'}`);
     }
     
     const systemUserId = users?.value?.[0]?.systemuserid;
